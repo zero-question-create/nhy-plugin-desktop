@@ -264,6 +264,9 @@ class DesktopWindow(QWidget):
     def __init__(self, width: int, height: int, wallpaper: str = ""):
         super().__init__()
         self.setWindowTitle("辉夜的工作桌面")
+        icon_path = PROJECT_DIR / "assets" / "logo.ico"
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(width, height)
         self.setStyleSheet("color:#e8e8e8;")
 
