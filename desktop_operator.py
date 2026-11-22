@@ -22,6 +22,11 @@ from typing import Optional
 from config.api_config import config
 from core.llm_interface import call_api_thinking
 from core.action_valve import ACTION_VALVE, ActionIntent, state_token
+from .perception import ElementRegistry, build_digest, classify_error
+from .planner import plan_task
+from .task_memory import remember_plan
+from .trace import TRACE
+from .verifier import verify_action, verify_done
 from utils.monitor import append_log
 from . import input as desktop_input
 from . import uia
@@ -33,17 +38,17 @@ _SYSTEM = """你是辉夜在电脑上的操作手，只负责动手，不负责�
 可用动作：
 {"action":"launch","name":"程序名、exe 路径或快捷方式路径"}
 {"action":"snapshot"}
-{"action":"click","ref":"w...e...g..."}
-{"action":"set_value","ref":"...","text":"要写入的完整文本"}
+{"action":"click","id":"e12"}
+{"action":"set_value","id":"e12","text":"要写入的完整文本"}
 {"action":"type_text","text":"要输入的文字"}
 {"action":"key","keys":"ctrl+a"}
-{"action":"copy","ref":"..."}
+{"action":"copy","id":"e12"}
 {"action":"copy_url"}
-{"action":"paste","ref":"..."}
+{"action":"paste","id":"e12"}
 {"action":"clipboard_get"}
 {"action":"clipboard_set","text":"要放进剪贴板的文字"}
-{"action":"focus","ref":"..."}
-{"action":"scroll","direction":"down","pages":1,"ref":"..."}
+{"action":"focus","id":"e12"}
+{"action":"scroll","direction":"down","pages":1,"id":"e12"}
 {"action":"click_at","x":640,"y":360,"button":"left","clicks":1}
 {"action":"type_at","x":640,"y":360,"text":"要键入的内容"}
 {"action":"drag","from":[500,400],"to":[800,400]}
@@ -59,29 +64,30 @@ _SYSTEM = """你是辉夜在电脑上的操作手，只负责动手，不负责�
 
 规则：
 1. 只输出 JSON；禁止输出解释、对话、自然语言段落——你不负责组织语言。
-2. 只能使用【界面】里出现过的引用；引用失效就先用 snapshot 重新拿。
-3. 能用 set_value / click(ref) 就不要用坐标；坐标只在语义动作失败时使用。
+2. 只能使用【界面摘要】里出现过的 id；id 失效就先用 snapshot 重新拿。
+3. 能用 set_value / click(id) 就不要用坐标；坐标只在语义动作失败时使用。
 4. 需要坐标时，只能用【界面】里 @l,t,r,b 给出的屏幕坐标或任务里明确给的坐标，禁止猜；点击一般取矩形内靠近中心的位置。
 5. 一次只走一步，动作后我会把界面变化给你。
 6. 任务完成用 done，确认做不到用 fail；summary 只写事实，不写对话。
 7. 如果上一步已经成功点击/聚焦同一处而界面没有变化，不要重复同一个动作，继续下一步（例如键入文字）。
-8. 看到账号、登录、确认、发送等明确按钮/列表项时，直接 click；不要用连续 snapshot(ref) 一层层钻树。
+8. 看到账号、登录、确认、发送等明确按钮/列表项时，直接 click；不要用连续 snapshot 一层层钻树。
 9. 同一窗口最多连续观察 2 次；第 3 次必须执行点击/输入/按键，或者 done/fail。
-10. 如果界面只有空 Pane/Document，不要自己找深层引用；系统会深取一次树，等下一轮结果。
+10. 如果摘要里只有空 Pane/Document，不要自己找深层 id；系统会深取一次树，等下一轮结果。
 11. 同一程序在一个任务里最多 launch 一次；已经打开就直接操作现有窗口，不要为了“刷新”反复启动。
-12. 浏览器页面内容在深树里；如果【界面】只有地址栏和工具栏，先执行 {"action":"links"}，不要用坐标猜页面内容。
-13. 任务是找视频、网页或链接时，【页面链接】/links 返回的“标题 + URL”就是页面上的结果；能直接回答就直接 done，summary 写“标题 + URL”，不要为了确认反复滚动或点开。
+12. 浏览器页面内容在深树里；如果摘要只有地址栏和工具栏，先执行 {"action":"links"}，不要用坐标猜页面内容。
+13. 任务是找视频、网页或链接时，links 返回的“标题 + URL”就是页面上的结果；能直接回答就直接 done，summary 写“标题 + URL”，不要为了确认反复滚动或点开。
 14. 只有需要进入某个结果页时才 click 对应的 Hyperlink；不要重复 launch 浏览器，也不要把空白标签页当成任务页面。
 15. 任务点名网站（例如 B站/哔哩哔哩）时，用 open_url 直接打开该站点的搜索页（B站：https://search.bilibili.com/all?keyword=关键词），不要依赖浏览器默认搜索引擎。
 16. 页面正在跳转时 UIA 可能短暂报错；系统会自动重试，不要因为一次读取失败就放弃。
 17. 任何窗口和程序都可以操作，包括 ZCode、辉夜网页控制面板、系统设置；不要因为名字特殊就跳过。只有确实没有权限或控件不可用时才 fail。
 18. “控制面板”默认指辉夜自己的网页控制面板（窗口标题含 Nascence/辉夜，地址见任务里的 panel_url），不是 Windows 的 control.exe；需要打开时用 open_url，不要 launch control。
-19. 复制地址栏/输入框内容用 copy(ref)，它会回读剪贴板并返回真实文本；只按 ctrl+c 不算复制成功。
-20. 粘贴用 paste(ref)，会返回剪贴板里实际粘贴的文本；任务提到“剪贴板里的链接”时先用 clipboard_get 确认内容，不要凭空说“已经复制好了”。
+19. 复制地址栏/输入框内容用 copy(id)，它会回读剪贴板并返回真实文本；只按 ctrl+c 不算复制成功。
+20. 粘贴用 paste(id)，会返回剪贴板里实际粘贴的文本；任务提到“剪贴板里的链接”时先用 clipboard_get 确认内容，不要凭空说“已经复制好了”。
 21. 复制当前网页地址栏链接用 copy_url；copy 只能用于 Edit 输入框/地址栏，不要用 copy 复制页面文字，否则会把剪贴板覆盖成非链接内容。
 22. 关闭当前窗口用 close_window；关闭整个浏览器/程序用 close_app。不要用 win+d、win+e 或点击聊天项来代替关闭窗口。
 23. 关闭时出现标题含“确认关闭/确认”的弹窗，不要忽略；先看弹窗内容，任务确实要关就点“确定”，只是试探/不能关就点“取消”。选择要由当前任务决定。
 24. 只有【任务】明确要求“再做一次/再点一下/再翻一页/再发一次”时，才在该动作 JSON 里加 `"repeat_override": true`；其它情况不要加，重复动作会被动作阀拦下。
+25. 【上一步结果】里有 error_class 时按类型处理：stale_ref 先 snapshot；element_not_found/window_not_found 重新确认窗口；disabled 换控件或等待；timeout 等待后再看；dialog_open 先看弹窗内容再点确定/取消/不保存；permission_denied 直接 fail。
 """
 
 
@@ -320,12 +326,16 @@ def _parse(raw: str) -> dict:
     return {}
 
 
+def _element_label(action: dict) -> str:
+    return str(action.get("id") or action.get("sid") or action.get("ref") or "")
+
+
 def _describe(action: dict) -> str:
     kind = str(action.get("action") or "")
     if kind == "launch":
         return f"启动 {action.get('name') or '程序'}"
     if kind == "click":
-        return f"点击 {action.get('ref')}"
+        return f"点击 {_element_label(action)}"
     if kind == "set_value":
         text = str(action.get("text") or "")
         return f"写入 {text[:20]}"
@@ -334,17 +344,17 @@ def _describe(action: dict) -> str:
     if kind == "key":
         return f"按键 {action.get('keys')}"
     if kind == "copy":
-        return f"复制 {action.get('ref')}"
+        return f"复制 {_element_label(action)}"
     if kind == "copy_url":
         return "复制当前网址"
     if kind == "paste":
-        return f"粘贴到 {action.get('ref')}"
+        return f"粘贴到 {_element_label(action)}"
     if kind == "clipboard_get":
         return "读取剪贴板"
     if kind == "clipboard_set":
         return f"写入剪贴板 {str(action.get('text') or '')[:16]}"
     if kind == "focus":
-        return f"聚焦 {action.get('ref')}"
+        return f"聚焦 {_element_label(action)}"
     if kind == "scroll":
         return f"滚动 {action.get('direction') or 'down'}"
     if kind == "click_at":
@@ -483,8 +493,21 @@ def _desktop_click_handoff(window: int, before: set, prefer: str = "") -> int:
 
 
 def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
-             prefer: str = "") -> dict:
+             prefer: str = "", registry=None) -> dict:
     kind = str(action.get("action") or "").strip().lower()
+    if registry is not None:
+        sid = str(action.get("id") or action.get("sid") or "")
+        if sid:
+            record = registry.resolve(sid)
+            if record is None:
+                return {
+                    "ok": False,
+                    "error": "控件 ID 已失效，请先 snapshot 重新查看界面",
+                    "error_class": "stale_ref",
+                    "id": sid,
+                }
+            action = dict(action)
+            action["ref"] = record.ref
     if kind == "launch":
         name = str(action.get("name") or "")
         worker = plugin.worker_state()
@@ -520,14 +543,22 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
         if not window:
             return {"ok": False, "error": "没有目标窗口，先 launch 或 snapshot"}
 
-        def find_prompt_dialog(pid: int):
-            """找到“确认关闭”这类模态弹窗，交给模型看，不替它点。"""
+        def find_prompt_dialog(pid: int, main_hwnd: int = 0):
+            """找到“确认关闭/保存”这类对话框，交给模型看，不替它点。"""
             for item in uia.list_windows(only_titled=True):
                 if pid and int(item["pid"]) != int(pid):
                     continue
+                hwnd = int(item["hwnd"])
+                if main_hwnd and hwnd == int(main_hwnd):
+                    continue
                 title = str(item.get("title") or "")
-                if ("确认关闭" in title or "confirm" in title.lower()
-                        or "确认" in title or "warning" in title.lower()):
+                cls = str(item.get("class") or "")
+                lowered = title.lower()
+                if (cls == "#32770"
+                        or "确认关闭" in title or "confirm" in lowered
+                        or "确认" in title or "warning" in lowered
+                        or "保存" in title or "save" in lowered
+                        or "不保存" in title or "discard" in lowered):
                     return item
             return None
 
@@ -538,7 +569,7 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
                 pid = uia.window_pid(hwnd)
             except Exception:
                 pass
-            prompt = find_prompt_dialog(pid) if pid else None
+            prompt = find_prompt_dialog(pid, hwnd) if pid else None
             if prompt:
                 return False, prompt
             try:
@@ -546,7 +577,7 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
             except Exception:
                 pass
             time.sleep(0.5)
-            prompt = find_prompt_dialog(pid) if pid else None
+            prompt = find_prompt_dialog(pid, hwnd) if pid else None
             if prompt:
                 return False, prompt
             if not uia.window_exists(hwnd):
@@ -557,7 +588,7 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
             except Exception:
                 pass
             time.sleep(0.6)
-            prompt = find_prompt_dialog(pid) if pid else None
+            prompt = find_prompt_dialog(pid, hwnd) if pid else None
             if prompt:
                 return False, prompt
             return not uia.window_exists(hwnd), None
@@ -1006,8 +1037,13 @@ def _is_arrange_task(task: str) -> bool:
     return not any(key in blob for key in ("哪些", "列出", "看看", "内容", "标题"))
 
 
-def _valve_target(backend, action: dict) -> str:
-    """动作的稳定身份：优先角色+名字，避免临时 ref 换代导致认不出同一按钮。"""
+def _valve_target(backend, action: dict, registry=None) -> str:
+    """动作的稳定身份：优先 ACI 稳定 ID/角色+名字，避免临时 ref 换代认不出同一按钮。"""
+    sid = str(action.get("id") or action.get("sid") or "")
+    if sid and registry is not None:
+        target = registry.target(sid)
+        if target:
+            return target
     ref = str(action.get("ref") or "")
     if ref:
         try:
@@ -1026,14 +1062,15 @@ def _valve_target(backend, action: dict) -> str:
     return ""
 
 
-def _valve_intent(backend, action: dict, kind: str, goal_id: str, step: int) -> ActionIntent:
+def _valve_intent(backend, action: dict, kind: str, goal_id: str, step: int,
+                  registry=None) -> ActionIntent:
     payload = (
         action.get("text") or action.get("url") or action.get("keys")
         or action.get("summary") or ""
     )
     return ActionIntent(
         action=kind,
-        target=_valve_target(backend, action),
+        target=_valve_target(backend, action, registry),
         payload=str(payload or ""),
         goal_id=goal_id,
         step=step,
@@ -1042,17 +1079,33 @@ def _valve_intent(backend, action: dict, kind: str, goal_id: str, step: int) -> 
 
 
 def run_task(plugin, task: str, context: str = "", goal_id: str = "",
-             cancel_event=None) -> dict:
+             cancel_event=None, goal=None, progress_cb=None) -> dict:
     """执行一个电脑任务；返回 {"ok", "summary", "lines"}。"""
     backend = uia.backend()
-    max_steps = max(1, min(40, _cfg_int("desktop_max_steps", 8)))
-    timeout = max(30, _cfg_int("desktop_task_timeout", 180))
+    registry = ElementRegistry()
+    try:
+        step_window = max(1, int(getattr(goal, "step_window", None) or config.get("desktop_step_window", 10)))
+    except (TypeError, ValueError):
+        step_window = 10
+    try:
+        safety_max_steps = max(step_window, int(config.get("desktop_safety_max_steps", 100)))
+    except (TypeError, ValueError):
+        safety_max_steps = max(step_window, 100)
+    try:
+        timeout = max(15.0, float(getattr(goal, "deadline", None) or config.get("desktop_task_timeout", 180)))
+    except (TypeError, ValueError):
+        timeout = 180.0
     goal_id = ACTION_VALVE.begin_goal(
         goal_id, text=task, deadline=timeout,
-        max_actions=max_steps, max_replans=2, max_no_progress=2,
+        max_actions=safety_max_steps, max_replans=2, max_no_progress=2,
     )
     profile = plugin.action_llm()
     started = time.time()
+    TRACE.event(
+        "goal_start", goal_id=goal_id, task=task,
+        step_window=step_window, safety_max_steps=safety_max_steps,
+        timeout=timeout,
+    )
     prefer = f"{task} {context}"
 
     # “桌面上开着哪些窗口”是全局枚举，不该让操作手盯着某一个窗口的树去猜。
@@ -1118,6 +1171,16 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
     snapshot_streak = 0
     blocked_sig = ""
     blocked_count = 0
+    verification_failures = 0
+    plan = None
+    if bool(config.get("desktop_plan_enabled", True)):
+        plan = plan_task(
+            task, context, profile=profile,
+            max_steps=max(1, _cfg_int("desktop_plan_max_steps", 6)),
+        )
+        if plan is not None:
+            append_log(f"[电脑] 计划：{plan.prompt_text()[:300]}")
+            TRACE.event("plan", goal_id=goal_id, task=task, steps=plan.summary())
     # 内置程序名给模型参考；它也可以直接给 exe/lnk 路径，不受白名单限制。
     try:
         seen_paths = set()
@@ -1134,8 +1197,32 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
 
     # 起步状态由插件 perform_task 的 detail 写入，这里不再重复一条。
 
-    for step in range(1, max_steps + 1):
+    step = 0
+    while step < safety_max_steps:
+        step += 1
         step_started = time.time()
+        if step > step_window:
+            summary = (
+                f"已经尝试 {step_window} 步还没完成，先暂停交回认知层；"
+                "可以停止，也可以让我继续。"
+            )
+            if progress_cb is not None:
+                try:
+                    progress_cb(
+                        step - 1, "window", {"ok": False},
+                        still_trying=True, summary=summary,
+                    )
+                except Exception:
+                    pass
+            ACTION_VALVE.end_goal(goal_id)
+            TRACE.event("goal_pause", goal_id=goal_id, step=step - 1, summary=summary)
+            return {
+                "ok": False,
+                "pending": True,
+                "still_trying": True,
+                "summary": summary,
+                "lines": lines,
+            }
         if cancel_event is not None and cancel_event.is_set():
             return {
                 "ok": False,
@@ -1230,32 +1317,31 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
                         snap["changed"] = None
                 except Exception:
                     pass
-        if step > 1 and snap.get("changed") is not None and snap.get("changed") <= 12:
-            tree_text = (snap.get("diff") or "") + "\n" + tree_text
-        # 去掉浏览器工具栏/书签栏，优先把网页里的按钮和输入框留给模型。
-        tree_text = _compact_browser_web(tree_text)
-        # 链接和页面控件摘要放在树前面：长页面截断时这些引用仍然可见。
-        link_summary = _link_summary(tree_text, limit=10)
-        control_summary = _control_summary(tree_text, limit=24)
-        prefixes = [part for part in (link_summary, control_summary) if part]
-        if prefixes:
-            tree_text = "\n".join(prefixes) + "\n" + tree_text
-        if len(tree_text) > 9000:
-            tree_text = tree_text[:9000] + "\n…（已截断）"
-
-        current_state = state_token(snap.get("text") or tree_text)
+        # ACI 摘要：控件清单 + 稳定 ID + 文本摘要。原始树只用于状态指纹，
+        # 不再整棵塞进提示词。
+        raw_text = tree_text or "（没有读到界面；下一轮先 snapshot 或 links。）"
+        digest_snap = dict(snap) if snap else {
+            "hwnd": window or 0, "title": "", "nodes": 0, "text": raw_text,
+        }
+        if not digest_snap.get("elements"):
+            digest_snap["text"] = _compact_browser_web(raw_text)
+        prompt_text = build_digest(digest_snap, registry, max_chars=7000)
+        plan_text = (plan.prompt_text() + "\n") if plan is not None else ""
+        current_state = state_token(snap.get("text") or raw_text)
         messages = [
             {"role": "system", "content": _SYSTEM},
             {
                 "role": "user",
                 "content": (
                     f"【任务】{task}\n"
+                    f"{plan_text}"
                     f"【此刻的情况】{context or '没有额外背景'}\n"
                     f"【可启动的程序】{apps_hint or '（内置表为空）'}"
                     "（也可以直接给 exe/lnk 路径）\n"
                     f"【上一步结果】{last_result}\n"
-                    f"【界面】\n{tree_text}\n\n"
-                    f"这是第 {step}/{max_steps} 步。请输出下一个动作 JSON。"
+                    f"【界面摘要】\n{prompt_text}\n\n"
+                    f"这是第 {step} 步（软窗口 {step_window} 步；到窗口仍未完成会暂停，"
+                    "交回认知层决定继续或停止）。请输出下一个动作 JSON。"
                 ),
             },
         ]
@@ -1278,12 +1364,54 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
         action = _parse(raw)
         kind = str(action.get("action") or "").strip().lower()
         append_log(f"[电脑] 第{step}步 {raw[:120]}")
+        TRACE.event(
+            "step", goal_id=goal_id, step=step, action=kind,
+            target=str(action.get("id") or action.get("sid") or action.get("ref") or ""),
+            raw_chars=len(raw_text or ""), digest_chars=len(prompt_text or ""),
+        )
 
         if kind == "done":
             summary = str(action.get("summary") or "做完了").strip()
+            verdict = {"ok": True, "reason": ""}
+            if bool(config.get("desktop_verify_done", True)):
+                verdict = verify_done(task, summary, plugin, plan)
+            if not verdict.get("ok"):
+                verification_failures += 1
+                TRACE.event(
+                    "verify_done_failed", goal_id=goal_id, step=step,
+                    reason=str(verdict.get("reason") or ""),
+                )
+                lines.append(f"验收未通过：{verdict.get('reason')}")
+                if verification_failures > 2:
+                    TRACE.event("goal_end", goal_id=goal_id, ok=False, summary=summary)
+                    return {
+                        "ok": False,
+                        "summary": f"完成说明没有通过验收：{verdict.get('reason')}",
+                        "lines": lines,
+                    }
+                last_result = (
+                    f"验收未通过：{verdict.get('reason')}。"
+                    "请继续操作或修正后，再用 done 汇报。"
+                )
+                continue
+            if plan is not None:
+                remember_plan(task, plan)
+            if progress_cb is not None:
+                try:
+                    progress_cb(step, "done", {"ok": True, "verified": verdict.get("ok")},
+                                summary=summary)
+                except Exception:
+                    pass
+            TRACE.event("goal_end", goal_id=goal_id, ok=True, summary=summary)
             return {"ok": True, "summary": summary, "lines": lines}
         if kind == "fail":
             summary = str(action.get("summary") or "没做成").strip()
+            if progress_cb is not None:
+                try:
+                    progress_cb(step, "fail", {"ok": False}, summary=summary)
+                except Exception:
+                    pass
+            TRACE.event("goal_end", goal_id=goal_id, ok=False, summary=summary)
             return {"ok": False, "summary": summary, "lines": lines}
         if not kind:
             last_result = "上一轮输出不是合法 JSON，请只输出一个动作 JSON。"
@@ -1308,7 +1436,7 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
         else:
             snapshot_streak = 0
 
-        intent = _valve_intent(backend, action, kind, goal_id, step)
+        intent = _valve_intent(backend, action, kind, goal_id, step, registry)
         verdict = ACTION_VALVE.check(intent, current_state)
         if verdict.decision == "abort":
             return {
@@ -1372,7 +1500,7 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
                 launched_apps.add(key)
         try:
             result = launch_skip if launch_skip is not None else _execute(
-                plugin, backend, action, int(window or 0), prefer
+                plugin, backend, action, int(window or 0), prefer, registry
             )
         except Exception as exc:
             # 单步异常不能带走整件事：记下原因，下一步让模型重新看界面。
@@ -1380,8 +1508,18 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
             result = {"ok": False, "error": f"动作执行出错：{exc}"}
         if not isinstance(result, dict):
             result = {"ok": False, "error": "动作没有返回结果"}
+        if not result.get("ok"):
+            result.update(classify_error(result))
+        verification = verify_action(action, result, backend, registry)
+        result["verified"] = bool(verification.get("verified"))
+        if result.get("ok") and not verification.get("ok", True):
+            result["ok"] = False
+            result.setdefault("error", verification.get("reason") or "验收未通过")
+            result["error_class"] = verification.get("error_class") or "verification_failed"
         if int(result.get("hwnd") or 0):
             window = int(result["hwnd"])
+        if plan is not None:
+            plan.advance(kind, result, todo_done=bool(action.get("todo_done")))
         ACTION_VALVE.record(
             intent, current_state, ok=bool(result.get("ok")),
             detail=str(result.get("error") or result.get("detail") or "")[:200],
@@ -1389,11 +1527,28 @@ def run_task(plugin, task: str, context: str = "", goal_id: str = "",
         append_log(
             f"[电脑] 第{step}步完成，耗时 {int((time.time() - step_started) * 1000)}ms"
         )
+        TRACE.event(
+            "result", goal_id=goal_id, step=step, action=kind,
+            ok=bool(result.get("ok")),
+            verified=bool(result.get("verified")),
+            error_class=str(result.get("error_class") or ""),
+            elapsed_ms=int((time.time() - step_started) * 1000),
+        )
+        if progress_cb is not None:
+            try:
+                progress_cb(
+                    step, kind, result,
+                    summary=f"第 {step} 步 {kind}：{'成功' if result.get('ok') else result.get('error_class') or '失败'}",
+                )
+            except Exception:
+                pass
         last_result = json.dumps(result, ensure_ascii=False)
         lines.append(f"{_describe(action)}：{'成功' if result.get('ok') else result.get('error')}")
 
+    summary = f"电脑动作达到安全上限 {safety_max_steps} 步，先停下（{task}）"
+    TRACE.event("goal_end", goal_id=goal_id, ok=False, summary=summary)
     return {
         "ok": False,
-        "summary": f"这件事花了 {max_steps} 步还没做完，先停下（{task}）",
+        "summary": summary,
         "lines": lines,
     }

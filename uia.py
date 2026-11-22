@@ -599,6 +599,15 @@ class UiaBackend:
             "name": entry.get("name") or "",
         }
 
+    def element_value(self, ref: str) -> dict:
+        """读取 Edit/Document 当前值，用于 set_value 后置验证。"""
+        control, _entry = self._resolve(ref)
+        try:
+            value = str(control.GetValuePattern().Value or "")
+            return {"ok": True, "value": value}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     # ---------- 观察 ----------
     def snapshot(
         self,
@@ -642,6 +651,7 @@ class UiaBackend:
         lines: List[str] = []
         signatures: Dict[str, str] = {}
         refs: Dict[str, dict] = {}
+        elements: List[dict] = []
         counter = {"n": 0, "skipped": 0}
         base_depth = len(start_path)
 
@@ -727,17 +737,42 @@ class UiaBackend:
                     "role": role,
                     "name": name,
                 }
+                automation_id = ""
+                try:
+                    automation_id = _clean(getattr(control, "AutomationId", "") or "", 60)
+                except Exception:
+                    pass
+                bounds = None
+                if with_bounds and actions:
+                    try:
+                        rect = control.BoundingRectangle
+                        bounds = [
+                            int(rect.left), int(rect.top),
+                            int(rect.right), int(rect.bottom),
+                        ]
+                    except Exception:
+                        bounds = None
+                elements.append({
+                    "ref": ref_key,
+                    "role": role,
+                    "name": name,
+                    "value": value,
+                    "actions": list(actions),
+                    "automation_id": automation_id,
+                    "bounds": bounds,
+                    "enabled": bool(enabled),
+                    "depth": int(level),
+                    "path": list(path),
+                })
                 tail = ""
+                if automation_id:
+                    tail += f' id="{automation_id}"'
                 if value:
                     tail += f' value="{value}"'
                 if actions:
                     tail += " actions=" + ",".join(actions)
-                if with_bounds and actions:
-                    try:
-                        rect = control.BoundingRectangle
-                        tail += f" @{int(rect.left)},{int(rect.top)},{int(rect.right)},{int(rect.bottom)}"
-                    except Exception:
-                        pass
+                if bounds:
+                    tail += f" @{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}"
                 if not enabled:
                     tail += " [disabled]"
                 lines.append(f"{indent}{ref_key} {role} \"{name}\"{tail}")
@@ -764,6 +799,7 @@ class UiaBackend:
             "nodes": counter["n"],
             "chars": len(text),
             "text": text,
+            "elements": elements,
         }
         if not ref:
             previous = self._last.get(hwnd) or {}

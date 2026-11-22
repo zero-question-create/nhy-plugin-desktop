@@ -7,10 +7,11 @@
 from __future__ import annotations
 
 from plugins.panel import PanelProvider
+from .trace import read_trace_tasks
 
 _FIELDS = (
     "desktop_use_real_desktop",
-    "desktop_max_steps",
+    "desktop_step_window",
     "desktop_task_timeout",
     "desktop_runtime_enabled",
     "desktop_runtime_idle_interval",
@@ -49,11 +50,11 @@ class DesktopPanelProvider(PanelProvider):
                     "help": "打开后不再启动虚拟工作桌面，辉夜直接操作真实 Windows 窗口和桌面。更稳定，但任务会动到你正在用的窗口；建议只在明确需要时开启。",
                 },
                 {
-                    "key": "desktop_max_steps",
-                    "label": "单任务最多步数",
+                    "key": "desktop_step_window",
+                    "label": "步数软窗口",
                     "type": "number",
                     "required": True,
-                    "help": "一个电脑任务最多让操作手走几步。步数越多越慢，也越容易反复试探；一般 8~16 步够用。",
+                    "help": "超过这个步数仍未完成时，只回报“仍在尝试，可随时停止”，不会直接失败。真正的停止由认知层、用户或超时决定。",
                 },
                 {
                     "key": "desktop_task_timeout",
@@ -169,6 +170,7 @@ class DesktopPanelProvider(PanelProvider):
             ],
             "hint": self.hint,
             "actions": [
+                {"key": "stop_task", "label": "停止当前电脑任务"},
                 {"key": "self_test", "label": "自测：打开记事本写一行"},
                 {"key": "show_workspace", "label": "显示工作桌面"},
                 {"key": "hide_workspace", "label": "收起工作桌面"},
@@ -196,6 +198,12 @@ class DesktopPanelProvider(PanelProvider):
         if status.get("busy"):
             task = f"正在操作：{status.get('task') or ''}（第 {status.get('step') or 0} 步）"
         runtime = status.get("runtime") or {}
+        receipt = status.get("receipt") or {}
+        if not task and receipt.get("state") in ("still_trying", "cancelling"):
+            task = (
+                f"电脑状态：{receipt.get('state')}，"
+                f"{receipt.get('summary') or '可以停止或继续'}"
+            )
         if not task and runtime:
             task = f"常驻运行时：{runtime.get('state') or 'idle'}"
             if runtime.get("queued"):
@@ -222,7 +230,7 @@ class DesktopPanelProvider(PanelProvider):
         cfg = panel_runtime.load_panel_config()
 
         for key in (
-            "desktop_max_steps", "desktop_task_timeout", "desktop_thought_window",
+            "desktop_step_window", "desktop_task_timeout", "desktop_thought_window",
             "desktop_runtime_idle_interval", "desktop_snapshot_cache_ttl",
         ):
             if key in values and str(values.get(key) or "").strip() != "":
@@ -283,6 +291,45 @@ class DesktopPanelProvider(PanelProvider):
         panel_runtime.apply_config_hot_reload(cfg)
         return {"ok": True}
 
+    def pages(self, plugin) -> list:
+        if not plugin.is_running():
+            return []
+        return [{
+            "id": "desktop_tasks",
+            "label": "电脑任务",
+            "order": 30,
+            "kind": "cards",
+            "title": "电脑任务轨迹",
+            "description": "最近的动作、回执、步数窗口、校验结果和耗时。数据来自 run/logs/desktop_trace.jsonl。",
+            "api": "/api/plugin/page?plugin=desktop&page=desktop_tasks",
+            "items_key": "tasks",
+            "empty": "还没有电脑任务轨迹。运行一次电脑任务后再来看。",
+            "card": {
+                "title": "task",
+                "state": "state",
+                "meta": [
+                    {"key": "step", "label": "步数"},
+                    {"key": "step_window", "label": "软窗口"},
+                    {"key": "elapsed", "label": "耗时", "suffix": "s"},
+                    {"key": "summary", "label": ""},
+                ],
+                "details_key": "events",
+                "detail_fields": ["time", "label"],
+            },
+        }]
+
+    def page_data(self, plugin, page_id: str, query: dict = None) -> dict:
+        if str(page_id or "") != "desktop_tasks":
+            return {"ok": False, "error": "未知页面"}
+        if not plugin.is_running():
+            return {"ok": False, "error": "电脑插件没有运行"}
+        query = query or {}
+        try:
+            limit = int(query.get("limit") or 30)
+        except (TypeError, ValueError):
+            limit = 30
+        return {"ok": True, "data": {"tasks": read_trace_tasks(limit)}}
+
     def running(self, plugin):
         return bool(plugin.is_running())
 
@@ -290,6 +337,8 @@ class DesktopPanelProvider(PanelProvider):
         key = str(key or "")
         if key == "self_test":
             return plugin.self_test()
+        if key == "stop_task":
+            return plugin.cancel_current_task("panel")
         if key == "show_workspace":
             return plugin.show_workspace()
         if key == "hide_workspace":

@@ -16,7 +16,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from config.api_config import config
+from core.repetition import similarity
 from . import uia
+from .trace import TRACE
 from utils.monitor import append_log
 
 _OPEN_RE = re.compile(
@@ -42,6 +45,15 @@ class DesktopGoal:
     status: str = "queued"       # queued / running / done / failed / cancelled
     cancel: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
+    step_window: int = 10
+    deadline: float = 180.0
+    acceptance: list = field(default_factory=list)
+    source_turn: str = ""
+    steps: int = 0
+    window_reported: bool = False
+    last_receipt_at: float = 0.0
+    last_receipt: dict = field(default_factory=dict)
+    cancel_reason: str = ""
 
 
 def _clean_name(text: str) -> str:
@@ -110,6 +122,12 @@ def try_fast_task(plugin, task: str, context: str = "") -> Optional[dict]:
     只处理“打开/关闭某个程序”“打开桌面上的某个图标”这类一句话任务，
     带“然后/输入/搜索/发给/切到会话”等后续动作的仍走完整任务循环。
     """
+    from .agents import try_agents
+
+    agent_result = try_agents(plugin, task, context)
+    if agent_result is not None:
+        return agent_result
+
     text = str(task or "").strip()
     if not text or _COMPLEX_RE.search(text):
         return None
@@ -220,6 +238,7 @@ class DesktopRuntime:
         self._idle_ticks = 0
         self._seq = 0
         self._last_error = ""
+        self._last_receipt: dict = {}
 
     def start(self) -> None:
         with self._lock:
@@ -246,18 +265,118 @@ class DesktopRuntime:
             self._state = "stopped"
             self._active = None
 
-    def submit(self, task: str, context: str = "") -> dict:
+    @staticmethod
+    def _normalize_task(task: str) -> str:
+        return re.sub(r"\s+", "", str(task or "")).lower()
+
+    def _receipt(self, goal: DesktopGoal, state: str = "", summary: str = "",
+                 verified: bool = False) -> dict:
+        state = str(state or goal.status or "unknown")
+        terminal = state in ("done", "failed", "cancelled", "superseded")
+        return {
+            "goal_id": goal.goal_id,
+            "state": state,
+            "task": goal.text,
+            "step": int(goal.steps),
+            "step_window": int(goal.step_window),
+            "elapsed": round(time.time() - goal.created_at, 2),
+            "can_stop": not terminal,
+            "verified": bool(verified),
+            "summary": str(summary or "")[:300],
+            "updated_at": round(time.time(), 3),
+        }
+
+    def _emit_receipt(self, goal: DesktopGoal, state: str = "", summary: str = "",
+                      verified: bool = False, force: bool = False) -> dict:
+        receipt = self._receipt(goal, state, summary, verified)
+        now = time.time()
+        interval = 4.0
+        try:
+            interval = max(0.5, float(config.get("desktop_receipt_interval", 4.0)))
+        except (TypeError, ValueError):
+            pass
+        terminal = receipt["state"] in ("done", "failed", "cancelled", "superseded")
+        if not force and not terminal and now - goal.last_receipt_at < interval:
+            return receipt
+        goal.last_receipt_at = now
+        goal.last_receipt = receipt
+        with self._lock:
+            self._last_receipt = receipt
+        try:
+            from core.cognition import notify_action_receipt
+
+            notify_action_receipt(receipt)
+        except Exception:
+            pass
+        TRACE.event("receipt", **receipt)
+        return receipt
+
+    def current_receipt(self) -> dict:
+        with self._lock:
+            goal = self._active
+            if goal is not None and goal.last_receipt:
+                return dict(goal.last_receipt)
+            return dict(self._last_receipt)
+
+    def submit(self, task: str, context: str = "", acceptance=None,
+               step_window: int = None, deadline: float = None,
+               source_turn: str = "", preempt: bool = False) -> dict:
         task = str(task or "").strip()
         if not task:
             return {"ok": False, "detail": "没有要交办的事"}
         if self._stop.is_set():
             return {"ok": False, "detail": "电脑运行时已经停止"}
+        try:
+            window = max(1, int(step_window if step_window is not None else config.get("desktop_step_window", 10)))
+        except (TypeError, ValueError):
+            window = 6
+        try:
+            total_deadline = max(
+                15.0,
+                float(deadline if deadline is not None else config.get("desktop_task_timeout", 180)),
+            )
+        except (TypeError, ValueError):
+            total_deadline = 180.0
+
         with self._lock:
+            active = self._active
+            if active is not None:
+                same = (
+                    self._normalize_task(task) == self._normalize_task(active.text)
+                    or similarity(task, active.text) >= 0.82
+                )
+                receipt = self._receipt(active, "running" if not active.cancel.is_set() else "cancelling")
+                if same:
+                    return {
+                        "ok": True,
+                        "busy": True,
+                        "duplicate": True,
+                        "detail": f"电脑已经在做这件事：{active.text[:80]}",
+                        "goal_id": active.goal_id,
+                        "receipt": receipt,
+                    }
+                if not preempt:
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "duplicate": False,
+                        "detail": "电脑正在做另一件事；先停止当前动作，再交新任务。",
+                        "goal_id": active.goal_id,
+                        "receipt": receipt,
+                    }
+                active.cancel_reason = "被新目标替代"
+                active.cancel.set()
+                active.status = "superseded"
+
             self._seq += 1
             goal = DesktopGoal(
                 goal_id=f"desk_{int(time.time() * 1000)}_{self._seq}",
                 text=task,
                 context=str(context or ""),
+                acceptance=list(acceptance or []),
+                step_window=window,
+                deadline=total_deadline,
+                source_turn=str(source_turn or ""),
             )
             try:
                 self._queue.put_nowait(goal)
@@ -265,22 +384,39 @@ class DesktopRuntime:
                 return {"ok": False, "detail": "电脑任务队列已满"}
             if self._active is None:
                 self._state = "queued"
-            return {
-                "ok": True,
-                "detail": f"我坐到电脑前，准备{task}",
-                "content_lines": [],
-                "goal_id": goal.goal_id,
-            }
+            receipt = self._receipt(goal, "accepted")
+            goal.last_receipt = receipt
+            self._last_receipt = receipt
+        self._emit_receipt(goal, "accepted", force=True)
+        return {
+            "ok": True,
+            "busy": False,
+            "detail": f"我坐到电脑前，准备{task}",
+            "content_lines": [],
+            "goal_id": goal.goal_id,
+            "receipt": receipt,
+        }
 
     def cancel(self, reason: str = "") -> bool:
         with self._lock:
             goal = self._active
             if goal is None:
                 return False
+            goal.cancel_reason = str(reason or "收到取消请求")
             goal.cancel.set()
             goal.status = "cancelling"
-        append_log(f"[电脑] 取消当前目标：{reason or '收到取消请求'}")
+        append_log(f"[电脑] 取消当前目标：{goal.cancel_reason}")
+        self._emit_receipt(goal, "cancelling", summary=goal.cancel_reason, force=True)
         return True
+
+    def cancel_current_task(self, reason: str = "") -> dict:
+        cancelled = self.cancel(reason)
+        return {
+            "ok": True,
+            "cancelled": cancelled,
+            "receipt": self.current_receipt(),
+            "detail": "已请求停止当前电脑任务" if cancelled else "当前没有正在执行的电脑任务",
+        }
 
     def status(self) -> dict:
         with self._lock:
@@ -301,6 +437,7 @@ class DesktopRuntime:
                 "queued": self._queue.qsize(),
                 "idle_ticks": self._idle_ticks,
                 "last_error": self._last_error,
+                "receipt": self.current_receipt(),
                 "valve": valve,
             }
 
@@ -350,15 +487,38 @@ class DesktopRuntime:
             pass
 
     def _run_goal(self, goal: DesktopGoal) -> None:
+        started = time.time()
         with self._lock:
             self._active = goal
             self._state = "executing"
             goal.status = "running"
+        TRACE.event(
+            "runtime_goal_start", goal_id=goal.goal_id,
+            task=goal.text, source="runtime",
+        )
+        self._emit_receipt(goal, "running", force=True)
         self.plugin._mark_goal_running(goal.goal_id)
+
+        def on_progress(step: int, action: str, result: dict = None,
+                        still_trying: bool = False, summary: str = "") -> None:
+            goal.steps = max(goal.steps, int(step or 0))
+            if still_trying:
+                goal.window_reported = True
+                self._emit_receipt(
+                    goal, "still_trying",
+                    summary=summary or "超出软步数窗口，仍在尝试；可以随时停止。",
+                    force=True,
+                )
+                return
+            self._emit_receipt(
+                goal, "running", summary=summary or (f"第 {goal.steps} 步：{action}" if action else ""),
+            )
+
         try:
             result = self.plugin._run_task(
                 goal.text, goal.context,
                 goal_id=goal.goal_id, cancel_event=goal.cancel,
+                goal=goal, progress_cb=on_progress,
             )
             if not isinstance(result, dict):
                 result = {"ok": False, "summary": "电脑任务没有返回结果", "lines": []}
@@ -368,13 +528,42 @@ class DesktopRuntime:
             append_log(f"[电脑] 常驻任务异常 {traceback.format_exc()}")
             result = {"ok": False, "summary": f"电脑这边出错了：{exc}", "lines": []}
         goal.result = result
-        if goal.cancel.is_set():
+        cancelled = bool(result.get("cancelled")) or bool(
+            goal.cancel.is_set() and not result.get("ok")
+        )
+        if goal.status == "superseded":
+            final_state = "superseded"
+            final_summary = goal.cancel_reason or "被新目标替代"
+        elif cancelled:
             goal.status = "cancelled"
+            final_state = "cancelled"
+            final_summary = goal.cancel_reason or str(result.get("summary") or "任务已取消")
+        elif result.get("pending") or result.get("still_trying"):
+            goal.status = "still_trying"
+            final_state = "still_trying"
+            final_summary = str(result.get("summary") or "还在尝试，可随时停止")
+        elif result.get("ok"):
+            goal.status = "done"
+            final_state = "done"
+            final_summary = str(result.get("summary") or "完成")
+            self._last_error = ""
         else:
-            goal.status = "done" if result.get("ok") else "failed"
-            if not result.get("ok"):
-                self._last_error = str(result.get("summary") or "")
+            goal.status = "failed"
+            final_state = "failed"
+            final_summary = str(result.get("summary") or "失败")
+            self._last_error = final_summary
+        TRACE.event(
+            "runtime_goal_end", goal_id=goal.goal_id,
+            ok=bool(result.get("ok")), cancelled=cancelled,
+            summary=final_summary,
+            elapsed_ms=int((time.time() - started) * 1000),
+        )
+        # 先写最终回执并唤醒认知循环，再把运行时置回 idle。
+        self._emit_receipt(
+            goal, final_state, summary=final_summary,
+            verified=bool(result.get("verified")), force=True,
+        )
         with self._lock:
             self._active = None
             self._state = "idle"
-        self.plugin._mark_goal_finished(goal.goal_id, result, cancelled=goal.cancel.is_set())
+        self.plugin._mark_goal_finished(goal.goal_id, result, cancelled=cancelled)

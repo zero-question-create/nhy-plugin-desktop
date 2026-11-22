@@ -102,6 +102,7 @@ class DesktopPlugin(Plugin):
         self._runtime = None
         self._task = None
         self._thread = None
+        self._task_cancel = None
         self._last_progress = 0.0
         self._last_observe = 0.0
         self._observe_stop = threading.Event()
@@ -882,6 +883,7 @@ class DesktopPlugin(Plugin):
             "step": int(task.get("step") or 0),
             "goal_status": str(task.get("status") or ""),
             "runtime": runtime,
+            "receipt": (runtime or {}).get("receipt") or {},
             "workspace": {
                 "running": bool(self._worker.running),
                 "visible": bool(state.get("visible")),
@@ -904,6 +906,8 @@ class DesktopPlugin(Plugin):
         return {"ok": True, "detail": "我坐到了电脑前"}
 
     async def close_app(self) -> dict:
+        if self._runtime is not None:
+            self._runtime.cancel("软件关闭")
         if self._real_mode():
             self._clear_states()
             self._remember("我停止使用真实桌面了。")
@@ -915,6 +919,21 @@ class DesktopPlugin(Plugin):
         return {"ok": True, "detail": "我把工作桌面收起来了"}
 
     # ---------- 任务 ----------
+    def cancel_current_task(self, reason: str = "") -> dict:
+        """认知层/面板停止当前动作循环；幂等。"""
+        if self._runtime is not None:
+            return self._runtime.cancel_current_task(reason)
+        with self._lock:
+            running = bool(self._task and self._task.get("status") in ("queued", "running"))
+            cancel_event = self._task_cancel
+        if running and cancel_event is not None:
+            cancel_event.set()
+        return {
+            "ok": True,
+            "cancelled": running,
+            "detail": "已请求停止电脑任务" if running else "当前没有正在执行的电脑任务",
+        }
+
     async def perform_task(self, task: str, context: str = "") -> dict:
         task = str(task or "").strip()
         if not task:
@@ -937,7 +956,27 @@ class DesktopPlugin(Plugin):
             }
         with self._lock:
             if self._task and self._task.get("status") in ("queued", "running"):
-                return {"ok": False, "detail": f"电脑还在忙：{self._task.get('text')}"}
+                active_text = str(self._task.get("text") or "")
+                same = task == active_text or _task_similar(task, active_text)
+                receipt = {}
+                if self._runtime is not None:
+                    receipt = self._runtime.current_receipt()
+                if same:
+                    return {
+                        "ok": True,
+                        "busy": True,
+                        "duplicate": True,
+                        "silent": True,
+                        "detail": f"电脑已经在做这件事：{active_text[:80]}",
+                        "receipt": receipt,
+                    }
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "duplicate": False,
+                    "detail": "电脑正在做另一件事；要换任务请先停止当前动作。",
+                    "receipt": receipt,
+                }
             if time.time() < self._task_cooldown_until and not explicit_repeat:
                 return {
                     "ok": False,
@@ -1007,8 +1046,13 @@ class DesktopPlugin(Plugin):
         runtime = self._ensure_runtime()
         if runtime is None:
             # 面板关闭常驻运行时：退回一次任务一个线程的旧路径。
+            cancel_event = threading.Event()
+            with self._lock:
+                self._task_cancel = cancel_event
             thread = threading.Thread(
-                target=self._run_task, args=(task, context),
+                target=self._run_task,
+                args=(task, context),
+                kwargs={"cancel_event": cancel_event},
                 name="DesktopTask", daemon=True,
             )
             self._thread = thread
@@ -1026,7 +1070,7 @@ class DesktopPlugin(Plugin):
         return submitted
 
     def _run_task(self, task: str, context: str, goal_id: str = "",
-                  cancel_event=None) -> dict:
+                  cancel_event=None, goal=None, progress_cb=None) -> dict:
         # 当前版本只走 NHY 自己的操作手（action_llm + UIA），不经过 dsh。
         # 外联 dsh 的适配代码保留在 acp_client.py / dsh_bridge.py，
         # 但运行路径不接线，等以后明确要做时再挂。
@@ -1050,6 +1094,7 @@ class DesktopPlugin(Plugin):
                     result = run_task(
                         self, task, context,
                         goal_id=goal_id, cancel_event=cancel_event,
+                        goal=goal, progress_cb=progress_cb,
                     )
             except Exception as exc:
                 import traceback
@@ -1060,10 +1105,11 @@ class DesktopPlugin(Plugin):
                 result = {"ok": False, "summary": f"电脑这边出错了：{exc}", "lines": []}
         if not isinstance(result, dict):
             result = {"ok": False, "summary": "电脑任务没有返回结果", "lines": []}
-        cancelled = bool(
-            (cancel_event is not None and cancel_event.is_set())
-            or result.get("cancelled")
+        cancelled = bool(result.get("cancelled")) or bool(
+            cancel_event is not None and cancel_event.is_set()
+            and not result.get("ok")
         )
+        pending = bool(result.get("pending") or result.get("still_trying"))
         if cancelled:
             result["ok"] = False
             result["cancelled"] = True
@@ -1073,7 +1119,8 @@ class DesktopPlugin(Plugin):
                 self._task.update(
                     status=(
                         "cancelled" if cancelled
-                        else ("done" if result.get("ok") else "failed")
+                        else ("still_trying" if pending
+                              else ("done" if result.get("ok") else "failed"))
                     ),
                     summary=str(result.get("summary") or ""),
                 )
@@ -1083,7 +1130,7 @@ class DesktopPlugin(Plugin):
                 self._recent_success = (
                     task, time.time(), str(result.get("summary") or "")
                 )
-            elif not cancelled:
+            elif not cancelled and not pending:
                 self._last_task_failure = (task, time.time())
                 self._task_cooldown_until = time.time() + 60.0
                 if not any(_task_similar(task, text) for text, _at in self._failed_tasks):
@@ -1096,7 +1143,10 @@ class DesktopPlugin(Plugin):
             APP_CONTEXT.remember_state("desktop_progress", "")
         except Exception:
             pass
-        self._remember_result(f"电脑那边结束了：{result.get('summary') or '没有留下说明'}")
+        if pending:
+            self._remember_result(f"电脑先暂停：{result.get('summary') or '还在尝试'}")
+        else:
+            self._remember_result(f"电脑那边结束了：{result.get('summary') or '没有留下说明'}")
         # 任务结束后桌面状态可能变了，刷新概览（覆盖同一个 key）。
         self._push_overview()
         return result
@@ -1118,7 +1168,8 @@ class DesktopPlugin(Plugin):
             self._task.update(
                 status=(
                     "cancelled" if cancelled
-                    else ("done" if result.get("ok") else "failed")
+                    else ("still_trying" if result.get("pending") or result.get("still_trying")
+                          else ("done" if result.get("ok") else "failed"))
                 ),
                 summary=str(result.get("summary") or ""),
             )
