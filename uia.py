@@ -608,6 +608,23 @@ class UiaBackend:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def element_text(self, ref: str) -> dict:
+        """读取 RichEdit/Document 的完整文本（TextPattern 回退）。"""
+        control, _entry = self._resolve(ref)
+        try:
+            value = str(control.GetTextPattern().GetText(-1) or "")
+            return {"ok": True, "text": value}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def element_native_handle(self, ref: str) -> dict:
+        """返回元素原生 HWND，供 Notepad 的 EM_* 分页读取使用。"""
+        control, _entry = self._resolve(ref)
+        try:
+            return {"ok": True, "hwnd": int(control.NativeWindowHandle or 0)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     # ---------- 观察 ----------
     def snapshot(
         self,

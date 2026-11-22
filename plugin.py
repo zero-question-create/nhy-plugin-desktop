@@ -22,6 +22,7 @@ import time
 from config.api_config import config
 from plugins.base import Capability, Plugin
 from . import uia
+from .notepad import NotepadReader
 from .desktop_runtime import DesktopRuntime, try_fast_task
 from .worker_client import DesktopWorker
 
@@ -400,6 +401,32 @@ class DesktopPlugin(Plugin):
         except Exception:
             return False
 
+    def read_notepad(self, page: int = 1, page_lines: int = None,
+                     current_page: bool = False) -> dict:
+        """按记事本窗口高度分页读取完整内容。"""
+        hwnd = self._notepad_hwnd()
+        if not hwnd:
+            return {"ok": False, "detail": "没有打开的记事本"}
+        try:
+            result = NotepadReader().read_page(
+                hwnd, page=page, page_lines=page_lines,
+                current_page=bool(current_page),
+            )
+        except Exception as exc:
+            return {"ok": False, "detail": f"记事本读取失败：{exc}"}
+        if result.get("ok"):
+            try:
+                from core.apps import APP_CONTEXT
+
+                APP_CONTEXT.remember_state(
+                    "desktop_notepad_page",
+                    f"[记事本第 {result.get('page')}/{result.get('pages')} 页]\n"
+                    f"{result.get('content') or ''}",
+                )
+            except Exception:
+                pass
+        return result
+
     def _push_overview(self) -> None:
         """把桌面概览写成“状态”，同一 key 覆盖，不再每轮追加。"""
         try:
@@ -465,6 +492,22 @@ class DesktopPlugin(Plugin):
                 if not hwnd:
                     return
                 self._active_notepad = hwnd
+                # 记事本按编辑区高度分页读完整内容；不再只取前 40 行/120 字。
+                page = NotepadReader().read_page(hwnd, current_page=True)
+                if page.get("ok"):
+                    from core.apps import APP_CONTEXT
+
+                    body = (
+                        f"记事本第 {page.get('page')}/{page.get('pages')} 页"
+                        f"（共 {page.get('total_lines')} 行）：\n{page.get('content') or ''}"
+                    )
+                    APP_CONTEXT.remember_state("desktop_app_记事本", body)
+                    APP_CONTEXT.remember_state(
+                        "desktop_notepad_page",
+                        f"[记事本第 {page.get('page')}/{page.get('pages')} 页]\n"
+                        f"{page.get('content') or ''}",
+                    )
+                    return
                 snap = uia.backend().snapshot(hwnd, max_nodes=300, depth=12)
                 lines = [ln for ln in (snap.get("text") or "").splitlines() if ln.strip()]
                 if not self._tree_meaningful(lines):
@@ -486,6 +529,15 @@ class DesktopPlugin(Plugin):
                 name = names.get(hwnd)
                 if not name or not uia.window_title(hwnd):
                     continue
+                if "记事本" in name or "notepad" in name.lower():
+                    page = NotepadReader().read_page(hwnd, current_page=True)
+                    if page.get("ok"):
+                        body = (
+                            f"{name}第 {page.get('page')}/{page.get('pages')} 页"
+                            f"（共 {page.get('total_lines')} 行）：\n{page.get('content') or ''}"
+                        )
+                        APP_CONTEXT.remember_state(f"desktop_app_{name}", body)
+                        continue
                 snap = uia.backend().snapshot(hwnd, max_nodes=300, depth=12)
                 lines = [ln for ln in (snap.get("text") or "").splitlines() if ln.strip()]
                 if not self._tree_meaningful(lines):
@@ -921,10 +973,27 @@ class DesktopPlugin(Plugin):
     # ---------- 任务 ----------
     def cancel_current_task(self, reason: str = "") -> dict:
         """认知层/面板停止当前动作循环；幂等。"""
-        if self._runtime is not None:
-            return self._runtime.cancel_current_task(reason)
         with self._lock:
-            running = bool(self._task and self._task.get("status") in ("queued", "running"))
+            if self._task and self._task.get("status") in ("queued", "running"):
+                self._task["status"] = "cancelling"
+                self._task["cancel_reason"] = str(reason or "")
+        if self._runtime is not None:
+            result = self._runtime.cancel_current_task(reason)
+            if result.get("cancelled"):
+                # 如果取消的是还没开始执行的排队目标，运行时不会走 _run_goal，
+                # 这里补一次收尾，避免插件侧任务永久停在 cancelling。
+                try:
+                    status = self._runtime.status()
+                except Exception:
+                    status = {}
+                if not status.get("goal_id") and not status.get("queued"):
+                    with self._lock:
+                        if self._task and self._task.get("status") == "cancelling":
+                            self._task["status"] = "cancelled"
+                            self._task["summary"] = str(reason or "已取消")
+            return result
+        with self._lock:
+            running = bool(self._task and self._task.get("status") == "cancelling")
             cancel_event = self._task_cancel
         if running and cancel_event is not None:
             cancel_event.set()
@@ -954,13 +1023,38 @@ class DesktopPlugin(Plugin):
                 "silent": True,
                 "detail": "聊天发送由聊天插件负责；电脑插件不代点聊天输入框，也不把剪贴板粘进聊天。",
             }
+        # 用户刚说“停下”，紧接着又交新任务：旧目标可能还在步骤边界收尾。
+        # 先等它真正退出（有上限），否则新任务会被“电脑正在做另一件事”直接拒掉。
+        runtime = self._runtime
         with self._lock:
-            if self._task and self._task.get("status") in ("queued", "running"):
+            current_status = str((self._task or {}).get("status") or "")
+        cancelling = current_status == "cancelling"
+        if runtime is not None and current_status in ("queued", "running", "cancelling"):
+            try:
+                status = runtime.status()
+                goal_status = str(status.get("goal_status") or "")
+                receipt_state = str((status.get("receipt") or {}).get("state") or "")
+                cancelling = cancelling or goal_status == "cancelling" or receipt_state == "cancelling"
+            except Exception:
+                pass
+            if cancelling:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, runtime.wait_idle, 6.0)
+        with self._lock:
+            if self._task and self._task.get("status") in ("queued", "running", "cancelling"):
                 active_text = str(self._task.get("text") or "")
                 same = task == active_text or _task_similar(task, active_text)
                 receipt = {}
                 if self._runtime is not None:
                     receipt = self._runtime.current_receipt()
+                if self._task.get("status") == "cancelling":
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "duplicate": False,
+                        "detail": "当前电脑任务还在停止收尾，稍等一下再交新任务。",
+                        "receipt": receipt,
+                    }
                 if same:
                     return {
                         "ok": True,

@@ -398,16 +398,42 @@ class DesktopRuntime:
         }
 
     def cancel(self, reason: str = "") -> bool:
+        reason = str(reason or "收到取消请求")
         with self._lock:
             goal = self._active
-            if goal is None:
-                return False
-            goal.cancel_reason = str(reason or "收到取消请求")
-            goal.cancel.set()
-            goal.status = "cancelling"
-        append_log(f"[电脑] 取消当前目标：{goal.cancel_reason}")
-        self._emit_receipt(goal, "cancelling", summary=goal.cancel_reason, force=True)
-        return True
+            if goal is not None:
+                goal.cancel_reason = reason
+                goal.cancel.set()
+                goal.status = "cancelling"
+        if goal is not None:
+            append_log(f"[电脑] 取消当前目标：{goal.cancel_reason}")
+            self._emit_receipt(goal, "cancelling", summary=goal.cancel_reason, force=True)
+
+        # 队列里还没执行的目标也直接取消；否则“停止”之后它还会冒出来跑。
+        queued_cancelled = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                # 保留 stop() 的终止哨兵。
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    pass
+                break
+            item.cancel_reason = reason
+            item.cancel.set()
+            item.status = "cancelled"
+            queued_cancelled.append(item)
+        for item in queued_cancelled:
+            self._emit_receipt(item, "cancelled", summary=reason, force=True)
+        if goal is None:
+            with self._lock:
+                if self._active is None:
+                    self._state = "idle"
+        return bool(goal is not None or queued_cancelled)
 
     def cancel_current_task(self, reason: str = "") -> dict:
         cancelled = self.cancel(reason)
@@ -417,6 +443,21 @@ class DesktopRuntime:
             "receipt": self.current_receipt(),
             "detail": "已请求停止当前电脑任务" if cancelled else "当前没有正在执行的电脑任务",
         }
+
+    def wait_idle(self, timeout: float = 6.0) -> bool:
+        """等当前目标真正退出（取消也要等它走到步骤边界）。
+
+        取消不是强杀：UIA/模型调用可能还在返回。调用方在“停止后立刻交新任务”
+        时先等这一小段，避免新目标被“电脑正在做另一件事”直接拒掉。
+        """
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            with self._lock:
+                if self._active is None:
+                    return True
+            time.sleep(0.05)
+        with self._lock:
+            return self._active is None
 
     def status(self) -> dict:
         with self._lock:
@@ -454,6 +495,10 @@ class DesktopRuntime:
             if self._stop.is_set():
                 goal.status = "cancelled"
                 break
+            # 先登记为 active，再进 _run_goal；否则 cancel() 在
+            # “刚取出队列、还没设置 active”的窗口里会以为没有任务可取消。
+            with self._lock:
+                self._active = goal
             self._run_goal(goal)
 
     def _idle_tick(self) -> None:
@@ -563,7 +608,9 @@ class DesktopRuntime:
             goal, final_state, summary=final_summary,
             verified=bool(result.get("verified")), force=True,
         )
+        # 先把插件侧任务状态收尾，再把运行时置回 idle。
+        # 否则“等 idle 后立刻交新任务”会看到旧的 running 状态而被拒。
+        self.plugin._mark_goal_finished(goal.goal_id, result, cancelled=cancelled)
         with self._lock:
             self._active = None
             self._state = "idle"
-        self.plugin._mark_goal_finished(goal.goal_id, result, cancelled=cancelled)
