@@ -22,6 +22,7 @@ import time
 from config.api_config import config
 from plugins.base import Capability, Plugin
 from . import uia
+from .desktop_runtime import DesktopRuntime, try_fast_task
 from .worker_client import DesktopWorker
 
 
@@ -98,6 +99,7 @@ class DesktopPlugin(Plugin):
         super().__init__(settings)
         self._lock = threading.RLock()
         self._running = False
+        self._runtime = None
         self._task = None
         self._thread = None
         self._last_progress = 0.0
@@ -121,6 +123,20 @@ class DesktopPlugin(Plugin):
     @staticmethod
     def _real_mode() -> bool:
         return bool(config.get("desktop_use_real_desktop", False))
+
+    def _ensure_runtime(self):
+        """常驻运行时按需启动：面板不启动插件也能接住测试/直接调用。"""
+        if not bool(config.get("desktop_runtime_enabled", True)):
+            return None
+        if self._runtime is not None:
+            return self._runtime
+        try:
+            interval = float(config.get("desktop_runtime_idle_interval", 5.0))
+        except (TypeError, ValueError):
+            interval = 5.0
+        self._runtime = DesktopRuntime(self, idle_interval=interval)
+        self._runtime.start()
+        return self._runtime
 
     def _ensure_worker(self) -> bool:
         if self._real_mode():
@@ -223,12 +239,24 @@ class DesktopPlugin(Plugin):
                     str(item.get("title") or "").strip()
                     for item in uia.list_windows(only_titled=True)
                     if str(item.get("title") or "").strip()
+                    and str(item.get("title") or "").strip() != "Program Manager"
                 ][:10]
             except Exception:
                 titles = []
             text = "我现在直接使用真实 Windows 桌面。"
             if titles:
                 text += "可见窗口：" + "、".join(titles) + "。"
+            # 桌面图标不在顶层窗口标题里，必须单独读 Progman 的 UIA 树；
+            # 否则“桌面上有什么”只会得到 Program Manager 这个名字。
+            try:
+                icons = uia.desktop_icons(limit=60)
+            except Exception:
+                icons = []
+            if icons:
+                names = "、".join(item["name"] for item in icons[:40])
+                if len(icons) > 40:
+                    names += " 等"
+                text += f"桌面图标（{len(icons)}）：{names}。"
             return text + "我可以直接看窗口里的控件、点击、输入和按键。"
         state = self.worker_state()
         if not state:
@@ -763,6 +791,7 @@ class DesktopPlugin(Plugin):
     # ---------- 服务 ----------
     async def start(self) -> None:
         self._running = True
+        self._ensure_runtime()
         self._apply_thought_window()
         if self._real_mode():
             self._push_overview()
@@ -778,6 +807,10 @@ class DesktopPlugin(Plugin):
 
     async def stop(self) -> None:
         self._running = False
+        runtime = self._runtime
+        if runtime is not None:
+            runtime.stop()
+        self._runtime = None
         self._stop_observer()
         self._restore_thought_window()
         self._clear_states()
@@ -792,9 +825,22 @@ class DesktopPlugin(Plugin):
         return bool(self._running)
 
     def apply_settings(self) -> None:
-        """面板保存后热应用（目前只影响思考窗口）。"""
+        """面板保存后热应用：思考窗口与常驻运行时。"""
         if self._running:
             self._apply_thought_window()
+        enabled = bool(config.get("desktop_runtime_enabled", True))
+        if enabled and self._running:
+            runtime = self._ensure_runtime()
+            if runtime is not None:
+                try:
+                    runtime.idle_interval = max(
+                        1.0, float(config.get("desktop_runtime_idle_interval", 5.0))
+                    )
+                except (TypeError, ValueError):
+                    pass
+        elif not enabled and self._runtime is not None:
+            self._runtime.stop()
+            self._runtime = None
 
     def conflict_note(self, others: list) -> str:
         """电脑插件与平台插件是两种接入方式：只提示，不阻止同时安装。"""
@@ -823,6 +869,7 @@ class DesktopPlugin(Plugin):
         self._prune_app_states()
         self._ensure_overview_present()
         self._observe_floating_windows()
+        runtime = self._runtime.status() if self._runtime is not None else {}
         return {
             "id": self.plugin_id,
             "label": self.label,
@@ -830,9 +877,11 @@ class DesktopPlugin(Plugin):
             "unread": 0,
             "current_conversation": "",
             "conversations": [],
-            "busy": bool(task.get("status") == "running"),
+            "busy": bool(task.get("status") in ("queued", "running")),
             "task": str(task.get("text") or ""),
             "step": int(task.get("step") or 0),
+            "goal_status": str(task.get("status") or ""),
+            "runtime": runtime,
             "workspace": {
                 "running": bool(self._worker.running),
                 "visible": bool(state.get("visible")),
@@ -870,6 +919,13 @@ class DesktopPlugin(Plugin):
         task = str(task or "").strip()
         if not task:
             return {"ok": False, "detail": "没有要交办的事"}
+        # 用户明确说“再试一次/重新打开/继续做”时，允许越过目标级去重；
+        # 具体动作的重复仍由 ActionValve 的 repeat_override 控制。
+        explicit_repeat = bool(re.search(
+            r"(再|重新|继续|又|强制).{0,6}(打开|启动|试|做|发|点|翻|来)"
+            r"|刚才.{0,6}(失败|没|错)|还没好.{0,4}再",
+            task,
+        ))
         # 聊天窗口的发送/粘贴是平台插件的事；电脑插件去点输入框只会
         # 反复 snapshot 到 12 步失败，再把失败提醒灌回认知循环。
         if (re.search(r"QQ|微信|聊天|对话|会话", task)
@@ -880,9 +936,9 @@ class DesktopPlugin(Plugin):
                 "detail": "聊天发送由聊天插件负责；电脑插件不代点聊天输入框，也不把剪贴板粘进聊天。",
             }
         with self._lock:
-            if self._task and self._task.get("status") == "running":
+            if self._task and self._task.get("status") in ("queued", "running"):
                 return {"ok": False, "detail": f"电脑还在忙：{self._task.get('text')}"}
-            if time.time() < self._task_cooldown_until:
+            if time.time() < self._task_cooldown_until and not explicit_repeat:
                 return {
                     "ok": False,
                     "silent": True,
@@ -893,14 +949,14 @@ class DesktopPlugin(Plugin):
                 (text, at) for text, at in self._failed_tasks if now - at < 1800
             ]
             for text, _at in self._failed_tasks:
-                if _task_similar(task, text):
+                if _task_similar(task, text) and not explicit_repeat:
                     return {
                         "ok": False,
                         "silent": True,
                         "detail": "这件电脑任务刚才失败过，先别换个说法继续追；"
                         "等用户明确要求再重试。",
                     }
-            if self._last_task_failure:
+            if self._last_task_failure and not explicit_repeat:
                 last_text, last_at = self._last_task_failure
                 if last_text == task and time.time() - last_at < 90:
                     return {
@@ -910,7 +966,7 @@ class DesktopPlugin(Plugin):
                     }
             # 同一件事刚成功过就别再跑一遍：语言层看到“电脑那边结束了”
             # 之前可能会把同一个搜索/打开动作连交三次，既浪费步数也刷屏。
-            if self._recent_success:
+            if self._recent_success and not explicit_repeat:
                 ok_task, ok_at, ok_summary = self._recent_success
                 if now - ok_at < 120 and _task_duplicate(task, ok_task):
                     return {
@@ -921,9 +977,9 @@ class DesktopPlugin(Plugin):
                     }
             self._task = {
                 "text": task,
-                "status": "running",
+                "status": "queued",
                 "step": 0,
-                "started": time.time(),
+                "queued": time.time(),
             }
         # 新任务开始：清掉上一轮电脑任务的“我坐到电脑前/结束了”记录，
         # 避免开着 QQ 音乐还在上下文里看到上次网易云的任务摘要。
@@ -948,36 +1004,77 @@ class DesktopPlugin(Plugin):
             if self._worker.running:
                 self._worker.show()
                 self._start_observer()
-        thread = threading.Thread(
-            target=self._run_task, args=(task, context), name="DesktopTask", daemon=True
-        )
-        self._thread = thread
-        thread.start()
-        return {
-            "ok": True,
-            "detail": f"我坐到电脑前，准备{task}",
-            "content_lines": [],
-        }
+        runtime = self._ensure_runtime()
+        if runtime is None:
+            # 面板关闭常驻运行时：退回一次任务一个线程的旧路径。
+            thread = threading.Thread(
+                target=self._run_task, args=(task, context),
+                name="DesktopTask", daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            return {
+                "ok": True,
+                "detail": f"我坐到电脑前，准备{task}",
+                "content_lines": [],
+            }
+        submitted = runtime.submit(task, context)
+        if not submitted.get("ok"):
+            with self._lock:
+                if self._task is not None:
+                    self._task.update(status="failed", summary=str(submitted.get("detail") or ""))
+        return submitted
 
-    def _run_task(self, task: str, context: str) -> None:
+    def _run_task(self, task: str, context: str, goal_id: str = "",
+                  cancel_event=None) -> dict:
         # 当前版本只走 NHY 自己的操作手（action_llm + UIA），不经过 dsh。
         # 外联 dsh 的适配代码保留在 acp_client.py / dsh_bridge.py，
         # 但运行路径不接线，等以后明确要做时再挂。
         from .desktop_operator import run_task
 
-        try:
-            result = run_task(self, task, context)
-        except Exception as exc:
-            import traceback
-
-            from utils.monitor import append_log
-
-            append_log(f"[电脑] 任务异常 {traceback.format_exc()}")
-            result = {"ok": False, "summary": f"电脑这边出错了：{exc}", "lines": []}
         with self._lock:
             if self._task is not None:
                 self._task.update(
-                    status="done" if result.get("ok") else "failed",
+                    status="running",
+                    step=0,
+                    started=time.time(),
+                    goal_id=goal_id,
+                )
+        if cancel_event is not None and cancel_event.is_set():
+            result = {"ok": False, "summary": "电脑任务已取消", "cancelled": True, "lines": []}
+        else:
+            try:
+                # 常用单步任务走确定性快路径；复杂任务才交给操作手。
+                result = try_fast_task(self, task, context)
+                if result is None:
+                    result = run_task(
+                        self, task, context,
+                        goal_id=goal_id, cancel_event=cancel_event,
+                    )
+            except Exception as exc:
+                import traceback
+
+                from utils.monitor import append_log
+
+                append_log(f"[电脑] 任务异常 {traceback.format_exc()}")
+                result = {"ok": False, "summary": f"电脑这边出错了：{exc}", "lines": []}
+        if not isinstance(result, dict):
+            result = {"ok": False, "summary": "电脑任务没有返回结果", "lines": []}
+        cancelled = bool(
+            (cancel_event is not None and cancel_event.is_set())
+            or result.get("cancelled")
+        )
+        if cancelled:
+            result["ok"] = False
+            result["cancelled"] = True
+            result.setdefault("summary", "电脑任务已取消")
+        with self._lock:
+            if self._task is not None:
+                self._task.update(
+                    status=(
+                        "cancelled" if cancelled
+                        else ("done" if result.get("ok") else "failed")
+                    ),
                     summary=str(result.get("summary") or ""),
                 )
             if result.get("ok"):
@@ -986,7 +1083,7 @@ class DesktopPlugin(Plugin):
                 self._recent_success = (
                     task, time.time(), str(result.get("summary") or "")
                 )
-            else:
+            elif not cancelled:
                 self._last_task_failure = (task, time.time())
                 self._task_cooldown_until = time.time() + 60.0
                 if not any(_task_similar(task, text) for text, _at in self._failed_tasks):
@@ -1002,6 +1099,29 @@ class DesktopPlugin(Plugin):
         self._remember_result(f"电脑那边结束了：{result.get('summary') or '没有留下说明'}")
         # 任务结束后桌面状态可能变了，刷新概览（覆盖同一个 key）。
         self._push_overview()
+        return result
+
+    def _mark_goal_running(self, goal_id: str) -> None:
+        with self._lock:
+            if self._task is not None:
+                self._task.update(
+                    status="running", started=time.time(), goal_id=str(goal_id or ""),
+                )
+
+    def _mark_goal_finished(self, goal_id: str, result: dict, cancelled: bool = False) -> None:
+        with self._lock:
+            if self._task is None:
+                return
+            current = str(self._task.get("goal_id") or "")
+            if current and goal_id and current != str(goal_id):
+                return
+            self._task.update(
+                status=(
+                    "cancelled" if cancelled
+                    else ("done" if result.get("ok") else "failed")
+                ),
+                summary=str(result.get("summary") or ""),
+            )
 
     def on_progress(self, text: str) -> None:
         """操作手每步回调；作为“状态”写入，同 key 覆盖。"""
@@ -1099,6 +1219,7 @@ class DesktopPlugin(Plugin):
     def status(self) -> dict:
         data = super().status()
         data["running"] = bool(self._running)
+        data["runtime"] = self._runtime.status() if self._runtime is not None else {}
         return data
 
 

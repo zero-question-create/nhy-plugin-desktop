@@ -21,6 +21,7 @@ from typing import Optional
 
 from config.api_config import config
 from core.llm_interface import call_api_thinking
+from core.action_valve import ACTION_VALVE, ActionIntent, state_token
 from utils.monitor import append_log
 from . import input as desktop_input
 from . import uia
@@ -80,6 +81,7 @@ _SYSTEM = """你是辉夜在电脑上的操作手，只负责动手，不负责�
 21. 复制当前网页地址栏链接用 copy_url；copy 只能用于 Edit 输入框/地址栏，不要用 copy 复制页面文字，否则会把剪贴板覆盖成非链接内容。
 22. 关闭当前窗口用 close_window；关闭整个浏览器/程序用 close_app。不要用 win+d、win+e 或点击聊天项来代替关闭窗口。
 23. 关闭时出现标题含“确认关闭/确认”的弹窗，不要忽略；先看弹窗内容，任务确实要关就点“确定”，只是试探/不能关就点“取消”。选择要由当前任务决定。
+24. 只有【任务】明确要求“再做一次/再点一下/再翻一页/再发一次”时，才在该动作 JSON 里加 `"repeat_override": true`；其它情况不要加，重复动作会被动作阀拦下。
 """
 
 
@@ -461,6 +463,25 @@ def _find_new_window(pid: int, before=None, prefer: str = "", timeout: float = 6
     return best_hwnd
 
 
+def _desktop_click_handoff(window: int, before: set, prefer: str = "") -> int:
+    """点桌面图标后，把目标切到新打开/新聚焦的窗口。
+
+    Progman 的图标 ListItem 只负责 Invoke，返回结果里没有新窗口句柄；
+    如果继续用桌面当目标，下一步就看不到刚打开的软件。
+    """
+    if before is None:
+        return 0
+    new_hwnd = _find_new_window(0, before, prefer=prefer, timeout=1.5)
+    if not new_hwnd:
+        try:
+            foreground = uia.foreground_window()
+        except Exception:
+            foreground = 0
+        if foreground and int(foreground) != int(window):
+            new_hwnd = int(foreground)
+    return int(new_hwnd or 0)
+
+
 def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
              prefer: str = "") -> dict:
     kind = str(action.get("action") or "").strip().lower()
@@ -697,8 +718,24 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
                             fallback.get("error") or "坐标点击失败"
                         ),
                     }
+        # 点桌面图标前先记下现有窗口；点击后再把目标切到新窗口。
+        desktop_hwnd = 0
+        try:
+            desktop_hwnd = uia.desktop_window()
+        except Exception:
+            desktop_hwnd = 0
+        before = None
+        if desktop_hwnd and int(window or 0) == int(desktop_hwnd):
+            try:
+                before = {int(item["hwnd"]) for item in uia.list_windows(only_titled=True)}
+            except Exception:
+                before = set()
         result = backend.click(ref)
         if result.get("ok"):
+            new_hwnd = _desktop_click_handoff(window, before, prefer)
+            if new_hwnd:
+                result["hwnd"] = new_hwnd
+                result["opened_from_desktop"] = True
             return result
         rect = backend.element_rect(ref)
         if not rect.get("ok"):
@@ -709,7 +746,7 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
         if window:
             desktop_input.focus_window(window)
         fallback = desktop_input.click(rect["x"], rect["y"])
-        return {
+        response = {
             **result,
             "ok": bool(fallback.get("ok")),
             "via": "click_at",
@@ -718,6 +755,12 @@ def _execute(plugin, backend: uia.UiaBackend, action: dict, window: int = 0,
                 fallback.get("error") or result.get("error") or "坐标点击失败"
             ),
         }
+        if response.get("ok"):
+            new_hwnd = _desktop_click_handoff(window, before, prefer)
+            if new_hwnd:
+                response["hwnd"] = new_hwnd
+                response["opened_from_desktop"] = True
+        return response
     if kind == "set_value":
         return backend.set_value(str(action.get("ref") or ""), str(action.get("text") or ""))
     if kind == "type_text":
@@ -916,6 +959,17 @@ def _task_window(task: str, context: str = "") -> int:
             )
             return int(best["hwnd"])
 
+    # “桌面上的 QQ/回收站/此电脑”要先落到 Progman，否则会去读当前前台窗口。
+    desktop_intent = any(
+        key in blob for key in ("桌面图标", "桌面上的", "桌面上", "桌面里", "回收站", "此电脑")
+    )
+    if desktop_intent and not any(
+        key in blob for key in ("浏览器", "网页", "知乎", "b站", "bilibili", "播放页")
+    ):
+        desktop_hwnd = uia.desktop_window()
+        if desktop_hwnd:
+            return desktop_hwnd
+
     needles = []
     if "控制面板" in blob:
         needles.append("控制面板")
@@ -952,11 +1006,51 @@ def _is_arrange_task(task: str) -> bool:
     return not any(key in blob for key in ("哪些", "列出", "看看", "内容", "标题"))
 
 
-def run_task(plugin, task: str, context: str = "") -> dict:
+def _valve_target(backend, action: dict) -> str:
+    """动作的稳定身份：优先角色+名字，避免临时 ref 换代导致认不出同一按钮。"""
+    ref = str(action.get("ref") or "")
+    if ref:
+        try:
+            info = backend.element_info(ref)
+            role = str(info.get("role") or "").strip()
+            name = str(info.get("name") or "").strip()
+            if name:
+                return f"{role}:{name}"
+        except Exception:
+            pass
+        return ref
+    for key in ("name", "text", "url", "keys", "direction", "app_id", "id", "conversation"):
+        value = action.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _valve_intent(backend, action: dict, kind: str, goal_id: str, step: int) -> ActionIntent:
+    payload = (
+        action.get("text") or action.get("url") or action.get("keys")
+        or action.get("summary") or ""
+    )
+    return ActionIntent(
+        action=kind,
+        target=_valve_target(backend, action),
+        payload=str(payload or ""),
+        goal_id=goal_id,
+        step=step,
+        user_override=bool(action.get("repeat_override")),
+    )
+
+
+def run_task(plugin, task: str, context: str = "", goal_id: str = "",
+             cancel_event=None) -> dict:
     """执行一个电脑任务；返回 {"ok", "summary", "lines"}。"""
     backend = uia.backend()
-    max_steps = max(1, min(40, _cfg_int("desktop_max_steps", 12)))
+    max_steps = max(1, min(40, _cfg_int("desktop_max_steps", 8)))
     timeout = max(30, _cfg_int("desktop_task_timeout", 180))
+    goal_id = ACTION_VALVE.begin_goal(
+        goal_id, text=task, deadline=timeout,
+        max_actions=max_steps, max_replans=2, max_no_progress=2,
+    )
     profile = plugin.action_llm()
     started = time.time()
     prefer = f"{task} {context}"
@@ -973,6 +1067,21 @@ def run_task(plugin, task: str, context: str = "") -> dict:
                 titles.append(title)
         summary = "当前打开的窗口：" + ("、".join(titles) if titles else "没有可见窗口")
         return {"ok": True, "summary": summary, "lines": []}
+
+    # “桌面上有哪些图标/快捷方式”同样是确定性读取，不交给操作手逐步猜。
+    if ("桌面" in task
+            and re.search(r"(图标|快捷方式|有什么|有哪些|列出|看看|看一下)", task)
+            and "窗口" not in task
+            and not re.search(r"(打开|双击|点击|启动|运行|删除|移动|重命名)", task)):
+        icons = uia.desktop_icons(limit=80)
+        if icons:
+            names = "、".join(item["name"] for item in icons)
+            return {
+                "ok": True,
+                "summary": f"桌面上的图标有：{names}",
+                "lines": [],
+            }
+        return {"ok": False, "summary": "没有读到桌面图标；桌面窗口可能没有暴露 UIA 树", "lines": []}
 
     # 窗口整理是确定性的平铺动作，不该让操作手用 win+tab/snapshot 瞎试。
     if _is_arrange_task(task):
@@ -1007,6 +1116,8 @@ def run_task(plugin, task: str, context: str = "") -> dict:
     llm_errors = 0
     launched_apps = set()
     snapshot_streak = 0
+    blocked_sig = ""
+    blocked_count = 0
     # 内置程序名给模型参考；它也可以直接给 exe/lnk 路径，不受白名单限制。
     try:
         seen_paths = set()
@@ -1024,6 +1135,14 @@ def run_task(plugin, task: str, context: str = "") -> dict:
     # 起步状态由插件 perform_task 的 detail 写入，这里不再重复一条。
 
     for step in range(1, max_steps + 1):
+        step_started = time.time()
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "ok": False,
+                "summary": "电脑任务已取消",
+                "cancelled": True,
+                "lines": lines,
+            }
         if time.time() - started > timeout:
             return {"ok": False, "summary": f"这件事做太久了，我先停下（{task}）", "lines": lines}
 
@@ -1124,6 +1243,7 @@ def run_task(plugin, task: str, context: str = "") -> dict:
         if len(tree_text) > 9000:
             tree_text = tree_text[:9000] + "\n…（已截断）"
 
+        current_state = state_token(snap.get("text") or tree_text)
         messages = [
             {"role": "system", "content": _SYSTEM},
             {
@@ -1188,6 +1308,47 @@ def run_task(plugin, task: str, context: str = "") -> dict:
         else:
             snapshot_streak = 0
 
+        intent = _valve_intent(backend, action, kind, goal_id, step)
+        verdict = ACTION_VALVE.check(intent, current_state)
+        if verdict.decision == "abort":
+            return {
+                "ok": False,
+                "summary": f"动作阀终止：{verdict.reason}（{task}）",
+                "lines": lines,
+            }
+        if verdict.decision == "block":
+            append_log(f"[动作阀] 阻止 {_describe(action)}：{verdict.reason}")
+            if verdict.signature == blocked_sig:
+                blocked_count += 1
+            else:
+                blocked_sig = verdict.signature
+                blocked_count = 1
+            if blocked_count >= 2:
+                return {
+                    "ok": False,
+                    "summary": f"同一个动作被反复阻止，先停下（{task}）",
+                    "lines": lines,
+                }
+            last_result = f"这个动作被动作阀阻止：{verdict.reason}；换一个动作。"
+            lines.append(f"阻止：{_describe(action)}（{verdict.reason}）")
+            continue
+        if verdict.decision == "replan":
+            append_log(f"[动作阀] 要求换动作：{_describe(action)}（{verdict.reason}）")
+            if not ACTION_VALVE.mark_replan(goal_id):
+                return {
+                    "ok": False,
+                    "summary": f"同一动作反复没有进展，先停下（{task}）",
+                    "lines": lines,
+                }
+            last_result = (
+                f"动作阀认为这个动作没有进展（{verdict.reason}）。"
+                "下一步必须换一个不同的动作，或 done/fail。"
+            )
+            lines.append(f"换动作：{_describe(action)}（{verdict.reason}）")
+            continue
+        if verdict.decision == "wait" and verdict.delay > 0:
+            time.sleep(min(3.0, verdict.delay))
+
         plugin.on_progress(f"第 {step} 步：{_describe(action)}")
         launch_skip = None
         if kind == "launch":
@@ -1221,6 +1382,13 @@ def run_task(plugin, task: str, context: str = "") -> dict:
             result = {"ok": False, "error": "动作没有返回结果"}
         if int(result.get("hwnd") or 0):
             window = int(result["hwnd"])
+        ACTION_VALVE.record(
+            intent, current_state, ok=bool(result.get("ok")),
+            detail=str(result.get("error") or result.get("detail") or "")[:200],
+        )
+        append_log(
+            f"[电脑] 第{step}步完成，耗时 {int((time.time() - step_started) * 1000)}ms"
+        )
         last_result = json.dumps(result, ensure_ascii=False)
         lines.append(f"{_describe(action)}：{'成功' if result.get('ok') else result.get('error')}")
 

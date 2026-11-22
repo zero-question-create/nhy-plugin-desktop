@@ -12,6 +12,9 @@ _FIELDS = (
     "desktop_use_real_desktop",
     "desktop_max_steps",
     "desktop_task_timeout",
+    "desktop_runtime_enabled",
+    "desktop_runtime_idle_interval",
+    "desktop_snapshot_cache_ttl",
     "desktop_thought_window",
     "desktop_allow_screenshot",
     "desktop_observe_software",
@@ -57,6 +60,24 @@ class DesktopPanelProvider(PanelProvider):
                     "label": "单任务超时（秒）",
                     "type": "number",
                     "help": "超过这个时长就收手，避免一个任务卡住整个认知循环。",
+                },
+                {
+                    "key": "desktop_runtime_enabled",
+                    "label": "常驻桌面运行时",
+                    "type": "bool",
+                    "help": "开启后电脑控制常驻：空闲时只刷新桌面概览、不调用模型；认知层交办目标后才执行。关闭后回到按任务临时启动线程的旧方式。",
+                },
+                {
+                    "key": "desktop_runtime_idle_interval",
+                    "label": "空闲刷新间隔（秒）",
+                    "type": "number",
+                    "help": "常驻运行时多久刷新一次桌面概览（窗口标题 + 桌面图标）。只读界面，不调用模型；设太小会增加 UIA 开销。",
+                },
+                {
+                    "key": "desktop_snapshot_cache_ttl",
+                    "label": "快照缓存（秒）",
+                    "type": "number",
+                    "help": "同一窗口在多少秒内复用同一份 UIA 快照。动作执行后会自动失效，不会拿旧界面判断下一步。",
                 },
                 {
                     "key": "desktop_thought_window",
@@ -174,6 +195,11 @@ class DesktopPanelProvider(PanelProvider):
         task = ""
         if status.get("busy"):
             task = f"正在操作：{status.get('task') or ''}（第 {status.get('step') or 0} 步）"
+        runtime = status.get("runtime") or {}
+        if not task and runtime:
+            task = f"常驻运行时：{runtime.get('state') or 'idle'}"
+            if runtime.get("queued"):
+                task += f"，排队 {runtime.get('queued')} 个"
         values["_status"] = {
             "service": "运行中" if plugin.is_running() else "已停止",
             "workspace": workspace_text,
@@ -195,10 +221,19 @@ class DesktopPanelProvider(PanelProvider):
         values = values if isinstance(values, dict) else {}
         cfg = panel_runtime.load_panel_config()
 
-        for key in ("desktop_max_steps", "desktop_task_timeout", "desktop_thought_window"):
+        for key in (
+            "desktop_max_steps", "desktop_task_timeout", "desktop_thought_window",
+            "desktop_runtime_idle_interval", "desktop_snapshot_cache_ttl",
+        ):
             if key in values and str(values.get(key) or "").strip() != "":
                 try:
-                    cfg[key] = int(float(values[key]))
+                    number = float(values[key])
+                    cfg[key] = (
+                        number if key in (
+                            "desktop_runtime_idle_interval",
+                            "desktop_snapshot_cache_ttl",
+                        ) else int(number)
+                    )
                 except (TypeError, ValueError):
                     return {"ok": False, "error": f"{key} 需要是数字"}
 
@@ -225,6 +260,8 @@ class DesktopPanelProvider(PanelProvider):
 
         if "desktop_allow_screenshot" in values:
             cfg["desktop_allow_screenshot"] = bool(values.get("desktop_allow_screenshot"))
+        if "desktop_runtime_enabled" in values:
+            cfg["desktop_runtime_enabled"] = bool(values.get("desktop_runtime_enabled"))
         if "desktop_use_real_desktop" in values:
             cfg["desktop_use_real_desktop"] = bool(values.get("desktop_use_real_desktop"))
         if "desktop_observe_software" in values:

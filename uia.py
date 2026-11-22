@@ -17,6 +17,7 @@ import ctypes.wintypes as wintypes
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -38,6 +39,16 @@ _PROP_EXPAND = 30035
 _PROP_SCROLL = 30039
 
 _PROJECT_DIR = Path(__file__).resolve().parents[2]
+
+
+def _snapshot_cache_ttl() -> float:
+    """快照缓存 TTL：同一动作内多次读同一窗口时复用，动作后主动失效。"""
+    try:
+        from config.api_config import config
+
+        return max(0.0, min(10.0, float(config.get("desktop_snapshot_cache_ttl", 1.2))))
+    except Exception:
+        return 1.2
 _APPS_FILE = _PROJECT_DIR / "config" / "desktop_apps.json"
 _APPS_EXAMPLE = _PROJECT_DIR / "config" / "desktop_apps.example.json"
 
@@ -135,6 +146,66 @@ def list_windows(only_titled: bool = True, include_hidden: bool = False) -> List
 
 def foreground_window() -> int:
     return int(user32.GetForegroundWindow())
+
+
+def desktop_window() -> int:
+    """真实桌面的 shell 窗口（Progman/WorkerW）。
+
+    桌面图标不在普通顶层窗口列表的“标题”里，而在 Progman 的 UIA 树
+    （Pane -> List "桌面" -> ListItem）中。操作手若只按标题找窗口，
+    永远找不到桌面图标；这里显式把桌面窗口解析出来。
+    """
+    shell = 0
+    shell_class = ""
+    try:
+        shell = int(user32.GetShellWindow() or 0)
+        shell_class = _window_class(shell) if shell else ""
+    except Exception:
+        shell = 0
+        shell_class = ""
+    if shell_class == "Progman":
+        return shell
+    # 有些系统 GetShellWindow 返回 WorkerW，图标仍在 Progman 下。
+    try:
+        for item in list_windows(only_titled=False, include_hidden=True):
+            if str(item.get("class") or "") == "Progman":
+                return int(item["hwnd"])
+    except Exception:
+        pass
+    if shell_class in ("Progman", "WorkerW"):
+        return shell
+    return 0
+
+
+def desktop_icons(limit: int = 80) -> List[dict]:
+    """读取真实桌面图标：名字 + 可点击引用。
+
+    只读 Pane -> List "桌面" 下的 ListItem，不遍历壁纸/任务栏，
+    比整棵桌面树便宜。读不到时返回空列表，由调用方决定是否降级。
+    """
+    hwnd = desktop_window()
+    if not hwnd:
+        return []
+    try:
+        snap = backend().snapshot(
+            hwnd, max_nodes=400, depth=8, chrome=True, with_bounds=True
+        )
+    except Exception:
+        return []
+    icons: List[dict] = []
+    seen = set()
+    for raw in (snap.get("text") or "").splitlines():
+        match = re.match(r'(\S+)\s+ListItem\s+"([^"]*)"', raw.strip())
+        if not match:
+            continue
+        name = match.group(2).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        icons.append({"ref": match.group(1), "name": name})
+        if len(icons) >= max(1, int(limit)):
+            break
+    return icons
 
 
 def window_title(hwnd: int) -> str:
@@ -433,7 +504,19 @@ class UiaBackend:
         self._refs: Dict[str, dict] = {}
         self._gen: Dict[int, int] = {}
         self._last: Dict[int, Dict[str, str]] = {}
+        self._snap_cache: Dict[tuple, tuple] = {}
         auto.SetGlobalSearchTimeout(2.0)
+
+    def invalidate(self, hwnd: Optional[int] = None) -> None:
+        """动作改变界面后清掉快照缓存；下一代 snapshot 会刷新 ref。"""
+        with self._lock:
+            if hwnd is None:
+                self._snap_cache.clear()
+                return
+            target = int(hwnd)
+            for key in list(self._snap_cache):
+                if int(key[0]) == target:
+                    self._snap_cache.pop(key, None)
 
     # ---------- 窗口 ----------
     @staticmethod
@@ -529,15 +612,28 @@ class UiaBackend:
     ) -> dict:
         _ensure_uia_thread()
         hwnd = self.resolve_window(window)
-        with self._lock:
-            self._gen[hwnd] = self._gen.get(hwnd, 1) + 1
-            generation = self._gen[hwnd]
         start_root = None
         start_path: List[int] = []
         if ref:
             start_root, entry = self._resolve(ref)
             start_path = list(entry["path"])
             hwnd = int(entry["hwnd"])
+
+        cache_key = (
+            int(hwnd), str(ref or ""), int(depth), int(max_nodes),
+            bool(diff), bool(chrome), bool(with_bounds),
+        )
+        cache_ttl = _snapshot_cache_ttl()
+        now = time.monotonic()
+        with self._lock:
+            if not diff:
+                cached = self._snap_cache.get(cache_key)
+                if cached and now - float(cached[0]) <= cache_ttl:
+                    if not ref:
+                        self._last[hwnd] = cached[2]
+                    return dict(cached[1])
+            self._gen[hwnd] = self._gen.get(hwnd, 1) + 1
+            generation = self._gen[hwnd]
 
         root = start_root or auto.ControlFromHandle(hwnd)
         if root is None:
@@ -688,6 +784,14 @@ class UiaBackend:
                 result["changed"] = len(changes)
             # 无论是否输出 diff 都记录本次签名，下一步才能对比。
             self._last[hwnd] = signatures
+        if not diff:
+            with self._lock:
+                self._snap_cache[cache_key] = (
+                    time.monotonic(), dict(result), dict(signatures),
+                )
+                if len(self._snap_cache) > 64:
+                    oldest = min(self._snap_cache, key=lambda key: self._snap_cache[key][0])
+                    self._snap_cache.pop(oldest, None)
         return result
 
     # ---------- 动作 ----------
@@ -704,6 +808,7 @@ class UiaBackend:
         for name, action in attempts:
             try:
                 action()
+                self.invalidate(entry["hwnd"])
                 return {"ok": True, "ref": ref, "via": name, "name": entry.get("name") or ""}
             except Exception as exc:
                 errors.append(f"{name}:{exc}")
@@ -713,11 +818,13 @@ class UiaBackend:
         control, entry = self._resolve(ref)
         try:
             control.GetValuePattern().SetValue(str(text))
+            self.invalidate(entry["hwnd"])
             return {"ok": True, "ref": ref, "via": "value", "name": entry.get("name") or ""}
         except Exception as exc:
             errors = [f"value:{exc}"]
         try:
             control.GetLegacyIAccessiblePattern().SetValue(str(text))
+            self.invalidate(entry["hwnd"])
             return {"ok": True, "ref": ref, "via": "legacy", "name": entry.get("name") or ""}
         except Exception as exc:
             errors.append(f"legacy:{exc}")
@@ -808,6 +915,7 @@ class UiaBackend:
         try:
             auto.SetClipboardText(str(text))
             auto.SendKeys("{Ctrl}v", waitTime=0.05)
+            self.invalidate()
             return {"ok": True, "via": "clipboard", "chars": len(str(text))}
         except Exception as exc:
             return {"ok": False, "error": f"输入失败：{exc}"}
@@ -816,6 +924,7 @@ class UiaBackend:
         _ensure_uia_thread()
         try:
             auto.SendKeys(str(keys), waitTime=0.05)
+            self.invalidate()
             return {"ok": True, "keys": str(keys)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -836,12 +945,14 @@ class UiaBackend:
                 pattern.Scroll(sign * amount / 100.0, 0)
             else:
                 pattern.Scroll(0, sign * amount / 100.0)
+            self.invalidate()
             return {"ok": True, "direction": direction, "pages": amount}
         except Exception as exc:
             # 没有 ScrollPattern 时退回滚轮语义的键盘翻页。
             try:
                 key = {"down": "{PageDown}", "up": "{PageUp}", "left": "{Left}", "right": "{Right}"}[direction]
                 auto.SendKeys(key)
+                self.invalidate()
                 return {"ok": True, "via": "key", "keys": key}
             except Exception:
                 return {"ok": False, "error": str(exc)}
@@ -852,6 +963,7 @@ class UiaBackend:
         try:
             control = auto.ControlFromHandle(hwnd)
             control.GetWindowPattern().Close()
+            self.invalidate()
             return {"ok": True, "hwnd": hwnd}
         except Exception as exc:
             return {"ok": False, "hwnd": hwnd, "error": str(exc)}
@@ -892,8 +1004,10 @@ class UiaBackend:
             if exe.lower().endswith(".lnk"):
                 # .lnk 交给 ShellExecute，CreateProcess 不能直接执行。
                 os.startfile(exe)
+                self.invalidate()
                 return {"ok": True, "launched": [exe], "pid": 0, "via": "startfile"}
             proc = subprocess.Popen(cmd, cwd=str(spec.get("cwd") or os.path.dirname(exe) or "."))
+            self.invalidate()
             return {"ok": True, "launched": cmd, "pid": int(proc.pid)}
         except Exception as exc:
             return {"ok": False, "error": f"启动失败：{exc}"}
